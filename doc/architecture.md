@@ -276,3 +276,222 @@ These decisions must be recorded in the relevant ADR or configuration documentat
 - Worker interruption and retry behavior are testable.
 - Resource limits and collection isolation are explicit.
 - Retrieval and embedding choices have measurable validation plans.
+
+## System Architecture Diagram
+
+              BUSINESS RESEARCH AGENT — SYSTEM ARCHITECTURE
+       Advanced RAG for evidence-backed Indian equity research
+                  Status: Proposed MVP Architecture
+                               |
+                               v
++------------------------------------------------------------------+
+|                         CLIENT LAYER                             |
+|                  Web UI / API Client                              |
++--------------------------------+---------------------------------+
+                                 |
+                                 v
++------------------------------------------------------------------+
+|                         CADDY                                     |
+|              Reverse Proxy / HTTPS Termination                  |
++--------------------------------+---------------------------------+
+                                 |
+                                 v
++------------------------------------------------------------------+
+|                         API SERVICE                              |
+|                                                                  |
+|  - Validate requests and upload limits                           |
+|  - Resolve company identity                                      |
+|  - Create tasks and return task IDs                               |
+|  - Expose status, progress, reports, cancellation                 |
+|  - Enforce collection boundaries                                 |
++----------------------+----------------------+--------------------+
+                       |                      |
+             Queue work|                      |Task updates
+                       v                      v
+              +----------------+    +---------------------------+
+              |     REDIS      |    |       POSTGRESQL          |
+              |                |    |                           |
+              | - Work queue   |    | - Tasks and lifecycle     |
+              | - Transient    |    | - Documents and ownership |
+              |   coordination |    | - Evidence and provenance |
+              +-------+--------+    | - Findings and calculations|
+                      |             | - Reports and validation  |
+                      |             | - Checkpoints and audits  |
+                      |             +-------------+-------------+
+                      |                           ^
+                      v                           |
++------------------------------------------------------------------+
+|                            WORKER                                |
+|                                                                  |
+|  - Consume queued work                                           |
+|  - Run bounded workflow stages                                   |
+|  - Coordinate research and ingestion                             |
+|  - Persist checkpoints and stage results                         |
+|  - Apply retry policies and resource limits                      |
++----------+------------------+-------------------+----------------+
+           |                  |                   |
+           v                  v                   v
++-------------------+ +-------------------+ +----------------------+
+| RETRIEVAL ENGINE  | | RESEARCH PLANNER  | | SOURCE ADAPTERS      |
+|                   | |                   | |                      |
+| - Query prep      | | - Create questions| | - Financial providers|
+| - Lexical search  | | - Track depend.   | | - Approved web       |
+| - Vector search   | | - Identify gaps   | |   sources             |
+| - Hybrid fusion   | | - Prioritize work | +----------------------+
+| - Optional rerank | | - Bound research  |
+| - Metadata filters| +-------------------+
+| - Return evidence |
++---------+---------+
+          |
+          v
++------------------------------------------------------------------+
+|                    EVIDENCE & ANALYSIS                           |
+|                                                                  |
+|  +----------------------+    +--------------------------------+  |
+|  | DOCUMENT EXTRACTION  |    | EMBEDDING BACKEND              |  |
+|  |                      |    |                                |  |
+|  | - PDF text extraction|    | - Local sentence-transformers  |  |
+|  | - OCR scanned pages  |    | - Or hosted embedding API      |  |
+|  +----------------------+    +--------------------------------+  |
+|                                                                  |
+|  +----------------------+    +--------------------------------+  |
+|  | FINANCIAL CALCULATOR |    | BUSINESS & VALUATION ANALYSIS  |  |
+|  |                      |    |                                |  |
+|  | - Deterministic math |    | - Industry and fundamentals    |  |
+|  | - Units and formulas |    | - Risks and scenarios          |  |
+|  | - Reproducible inputs|    | - Thesis and counter-thesis    |  |
+|  +----------------------+    +--------------------------------+  |
++--------------------------------+---------------------------------+
+                                 |
+                                 v
++------------------------------------------------------------------+
+|                    REPORT ASSEMBLY & VALIDATION                  |
+|                                                                  |
+|  - Assemble findings and citations                               |
+|  - Check evidence support and contradictions                     |
+|  - Validate calculations and required sections                   |
+|  - Record missing information and uncertainty                    |
+|  - Persist report and validation outcome                          |
++--------------------------------+---------------------------------+
+                                 |
+                                 v
++------------------------------------------------------------------+
+|                       FINAL RESEARCH REPORT                      |
+|                                                                  |
+|  - Evidence-backed findings                                      |
+|  - Source and page-level citations                               |
+|  - Reproducible financial calculations                           |
+|  - Valuation assumptions and scenarios                           |
+|  - Risks, conflicts, gaps, and limitations                       |
++------------------------------------------------------------------+
+
+
+                  DATA FLOW A — PDF INGESTION
+
+  PDF Upload
+      |
+      v
+  API Validation
+      |
+      v
+  Document Record + Ingestion Task
+      |
+      v
+  Worker: Hash and Deduplication
+      |
+      v
+  PDF Text Extraction / OCR
+      |
+      v
+  Normalize Text + Create Traceable Chunks
+      |
+      v
+  Add Stable IDs + Page/Source Metadata
+      |
+      v
+  Generate Embeddings + Update Lexical/Vector Indexes
+      |
+      v
+  Verify Indexing
+      |
+      v
+  Indexed / Failed / Quarantined
+
+
+             DATA FLOW B — QUESTION TO CITED REPORT
+
+  Research Request
+      |
+      v
+  API Validation + Company Identity Resolution
+      |
+      v
+  Durable Task Creation + Queue
+      |
+      v
+  Worker Establishes As-of Date and Required Topics
+      |
+      v
+  Research Planner Creates Bounded Questions
+      |
+      v
+  Source Acquisition + Evidence Retrieval
+      |
+      v
+  Evidence Sufficiency / Conflict / Gap Analysis
+      |
+      v
+  Deterministic Financial Calculations
+      |
+      v
+  Business, Industry, Risk and Valuation Analysis
+      |
+      v
+  Thesis / Counter-Thesis / Uncertainty Analysis
+      |
+      v
+  Report Assembly + Citation Validation
+      |
+      v
+  Persist Report + Validation + Provenance
+      |
+      v
+  Completed / Completed with Limitations / Failed / Cancelled
+
+
+                    EVALUATION HARNESS
+
+  Fixed, Versioned 40-Question Benchmark
+      |
+      +--> Hybrid vs Vector-Only Retrieval
+      |
+      +--> Reranking Enabled vs Disabled
+      |
+      +--> Query Rewriting Enabled vs Disabled
+      |
+      +--> Local vs Hosted Embeddings
+      |
+      v
+  Measure:
+  Precision@k | Recall@k | MRR | Citation Support
+  Correctness | Faithfulness | Fallback | Latency | Cost
+      |
+      v
+  Compare Results by Question Category
+      |
+      v
+  Apply Predefined Acceptance Criteria
+
+
+                    CORE ARCHITECTURAL RULES
+
+  1. PostgreSQL is the source of truth for durable application state.
+  2. Redis is for queueing and transient coordination.
+  3. Every material claim must have evidence or an explicit limitation.
+  4. Calculations must be deterministic and reproducible.
+  5. Retrieved documents and tool outputs are untrusted input.
+  6. Collection isolation must be enforced before evidence is returned.
+  7. Retries, workflow steps, runtime, and external calls are bounded.
+  8. Worker interruptions must be recoverable through checkpoints.
+  9. Failed validation must not produce a falsely completed report.
+ 10. Retrieval and embedding decisions must be measured, not assumed.
