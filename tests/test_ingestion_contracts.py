@@ -133,3 +133,8 @@ def test_chunk_offsets_can_be_omitted_for_non_text_aligned_extraction():
     chunk = valid_chunk(start_offset=None, end_offset=None)
     assert chunk.start_offset is None
     assert chunk.end_offset is None
+
+
+def test_chunk_rejects_blank_text():
+    with pytest.raises(ValidationError):
+        valid_chunk(chunk_text="   ")

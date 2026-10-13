@@ -548,11 +548,20 @@ class ExtractedChunk(ContractModel):
     extraction_warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("chunk_text")
+    @classmethod
+    def chunk_text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("chunk_text must not be blank")
+        return value
+
     @model_validator(mode="after")
     def chunk_offsets_are_ordered(self):
         if self.start_offset is not None and self.end_offset is not None:
             if self.end_offset < self.start_offset:
-                raise ValueError("end_offset must be greater than or equal to start_offset")
+                raise ValueError(
+                    "end_offset must be greater than or equal to start_offset"
+                )
         return self
 
 
