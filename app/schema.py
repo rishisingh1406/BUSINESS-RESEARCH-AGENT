@@ -462,13 +462,49 @@ class DocumentIngestionRequest(ContractModel):
     financial_year: str | None = None
     original_filename: str = Field(min_length=1)
     content_sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+    # Supported canonical MIME types: PDF, Markdown, HTML, and plain text.
+    # Aliases are normalized by the validator below.
     content_type: str = "application/pdf"
     file_size_bytes: int = Field(gt=0)
+    # This limit is intended for PDFs. Non-PDF parsers should leave page_count unset.
     page_count: int | None = Field(default=None, ge=1, le=300)
     upload_timestamp: datetime
     document_type: str = "annual_report"
-    storage_uri: str
+    storage_uri: str = Field(min_length=1)
     collection_idempotency_key: str | None = None
+
+    @field_validator("original_filename")
+    @classmethod
+    def filename_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("original_filename must not be blank")
+        return value
+
+    @field_validator("content_type")
+    @classmethod
+    def normalize_supported_content_type(cls, value: str) -> str:
+        value = value.strip().lower().split(";", 1)[0].strip()
+        aliases = {
+            "application/pdf": "application/pdf",
+            "text/markdown": "text/markdown",
+            "text/x-markdown": "text/markdown",
+            "text/html": "text/html",
+            "text/plain": "text/plain",
+        }
+        if value not in aliases:
+            raise ValueError(
+                "unsupported content_type; expected PDF, Markdown, HTML, or plain text"
+            )
+        return aliases[value]
+
+    @field_validator("storage_uri")
+    @classmethod
+    def storage_uri_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("storage_uri must not be blank")
+        return value
 
 
 class DocumentIngestionResult(ContractModel):
@@ -486,11 +522,16 @@ class DocumentIngestionResult(ContractModel):
     completed_at: datetime | None = None
 
     @model_validator(mode="after")
-    def duplicate_reference_consistency(self):
+    def ingestion_result_consistency(self):
         if self.status == IngestionStatus.DUPLICATE and not self.duplicate_of_document_id:
             raise ValueError("duplicate ingestion requires duplicate_of_document_id")
-        if self.status == IngestionStatus.FAILED and not (self.error_id or self.error_message):
-            raise ValueError("failed ingestion requires an error reference or message")
+        if self.status != IngestionStatus.DUPLICATE and self.duplicate_of_document_id:
+            raise ValueError("duplicate_of_document_id is only valid for duplicate status")
+        if self.status in {IngestionStatus.FAILED, IngestionStatus.QUARANTINED, IngestionStatus.REJECTED}:
+            if not (self.error_id or (self.error_message and self.error_message.strip())):
+                raise ValueError("failed, quarantined, or rejected ingestion requires an error reference or message")
+        if self.started_at and self.completed_at and self.completed_at < self.started_at:
+            raise ValueError("completed_at must be greater than or equal to started_at")
         return self
 
 
@@ -506,6 +547,13 @@ class ExtractedChunk(ContractModel):
     extraction_method: Literal["text", "ocr", "mixed", "unknown"] = "unknown"
     extraction_warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def chunk_offsets_are_ordered(self):
+        if self.start_offset is not None and self.end_offset is not None:
+            if self.end_offset < self.start_offset:
+                raise ValueError("end_offset must be greater than or equal to start_offset")
+        return self
 
 
 # ---------------------------------------------------------------------------
