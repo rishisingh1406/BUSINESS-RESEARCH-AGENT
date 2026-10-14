@@ -71,58 +71,76 @@ def parse_pdf(
     if max_file_size_bytes < 0:
         raise ValueError("max_file_size_bytes cannot be negative")
 
+    document = None
+
     try:
         file_warnings = []
 
-        if path.stat().st_size > max_file_size_bytes:
+        file_size = path.stat().st_size
+
+        if file_size > max_file_size_bytes:
             file_warnings.append("LARGE_FILE_SIZE")
 
-        with pymupdf.open(path) as document:
-            if document.is_encrypted:
-                raise PdfParseError("Encrypted PDFs are not supported")
+        # Read and close the file before PyMuPDF opens the PDF.
+        # This helps prevent file-lock issues on Windows.
+        with path.open("rb") as pdf_file:
+            pdf_bytes = pdf_file.read()
 
-            if len(document) == 0:
-                raise PdfParseError("PDF contains no pages")
+        document = pymupdf.open(
+            stream=pdf_bytes,
+            filetype="pdf",
+        )
 
-            if len(document) > max_pages:
-                raise PdfParseError(
-                    f"PDF has {len(document)} pages; maximum is {max_pages}"
-                )
+        if document.is_encrypted:
+            raise PdfParseError("Encrypted PDFs are not supported")
 
-            pages: list[ParsedPage] = []
+        if len(document) == 0:
+            raise PdfParseError("PDF contains no pages")
 
-            for index, page in enumerate(document):
-                text = page.get_text("text").strip()
-                page_warnings = []
-
-                if len(text) < low_text_threshold:
-                    page_warnings.append("LOW_EXTRACTABLE_TEXT")
-
-                pages.append(
-                    ParsedPage(
-                        page_number=index + 1,
-                        text=text,
-                        warnings=page_warnings,
-                    )
-                )
-
-            result_warnings = list(file_warnings)
-
-            if any(page.warnings for page in pages):
-                result_warnings.append(
-                    "ONE_OR_MORE_PAGES_HAVE_LOW_TEXT"
-                )
-
-            return PdfParseResult(
-                source_path=str(path),
-                pages=pages,
-                warnings=result_warnings,
+        if len(document) > max_pages:
+            raise PdfParseError(
+                f"PDF has {len(document)} pages; maximum is {max_pages}"
             )
+
+        pages: list[ParsedPage] = []
+
+        for index, page in enumerate(document):
+            text = page.get_text("text").strip()
+            page_warnings = []
+
+            if len(text) < low_text_threshold:
+                page_warnings.append("LOW_EXTRACTABLE_TEXT")
+
+            pages.append(
+                ParsedPage(
+                    page_number=index + 1,
+                    text=text,
+                    warnings=page_warnings,
+                )
+            )
+
+        result_warnings = list(file_warnings)
+
+        if any(page.warnings for page in pages):
+            result_warnings.append("ONE_OR_MORE_PAGES_HAVE_LOW_TEXT")
+
+        return PdfParseResult(
+            source_path=str(path),
+            pages=pages,
+            warnings=result_warnings,
+        )
 
     except PdfParseError:
         raise
+
     except Exception as exc:
-        raise PdfParseError(f"Could not parse PDF: {exc}") from exc
+        raise PdfParseError(
+            f"Could not parse PDF: {exc}"
+        ) from exc
+
+    finally:
+        if document is not None:
+            document.close()
 
 
 def parse_html(

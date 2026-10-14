@@ -520,6 +520,8 @@ class DocumentIngestionResult(ContractModel):
     error_message: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    quarantine_uri: str | None = None
+
 
     @model_validator(mode="after")
     def ingestion_result_consistency(self):
