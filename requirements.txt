@@ -1,2 +1,4 @@
 pydantic
 pymupdf
+redis>=5.0,<9.0
+psycopg[binary]>=3.2,<4
