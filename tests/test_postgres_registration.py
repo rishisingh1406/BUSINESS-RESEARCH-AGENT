@@ -55,7 +55,10 @@ def stores():
     yield store_a, store_b, collection_id
 
     # Remove only records created for this test collection.
-    with __import__("psycopg").connect(DATABASE_URL) as conn:
+    with __import__("psycopg").connect(
+    DATABASE_URL,
+    connect_timeout=5,
+) as conn:
         conn.execute(
             "DELETE FROM ingestion_request_keys WHERE collection_id = %s",
             (collection_id,),

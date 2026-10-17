@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Protocol, runtime_checkable
 
 import psycopg
@@ -10,6 +11,8 @@ from app.schema import (
     DocumentIngestionResult,
     IngestionStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class IdempotencyKeyConflict(ValueError):
@@ -136,6 +139,7 @@ class InMemoryRegistrationStore:
         normalized_request = request.model_copy(
             update={"content_sha256": content_hash}
         )
+
         self._documents[content_key] = normalized_request
         self._statuses[request.document_id] = IngestionStatus.QUEUED
 
@@ -156,7 +160,12 @@ class InMemoryRegistrationStore:
 class PostgresRegistrationStore:
     """PostgreSQL-backed registration store with transactional writes."""
 
-    def __init__(self, database_url: str | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        connect_timeout: int = 5,
+    ) -> None:
         self._database_url = database_url or os.getenv("DATABASE_URL")
 
         if not self._database_url:
@@ -165,15 +174,27 @@ class PostgresRegistrationStore:
                 "the DATABASE_URL environment variable."
             )
 
+        if connect_timeout <= 0:
+            raise ValueError("connect_timeout must be greater than zero.")
+
+        self._connect_timeout = connect_timeout
+
+    def _connect(self):
+        """Open a database connection with a bounded connection timeout."""
+        return psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+            connect_timeout=self._connect_timeout,
+        )
+
     def get_registered_document(
         self,
         document_id: str,
     ) -> tuple[DocumentIngestionRequest, IngestionStatus] | None:
         """Load a canonical request and its current status."""
-        with psycopg.connect(
-            self._database_url,
-            row_factory=dict_row,
-        ) as conn:
+        logger.debug("Loading registered document %s", document_id)
+
+        with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT request_data, status
@@ -199,7 +220,13 @@ class PostgresRegistrationStore:
         status: IngestionStatus,
     ) -> None:
         """Persist the status of a canonical document."""
-        with psycopg.connect(self._database_url) as conn:
+        logger.debug(
+            "Updating document %s to status %s",
+            document_id,
+            status.value,
+        )
+
+        with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE ingestion_documents
@@ -225,75 +252,132 @@ class PostgresRegistrationStore:
             update={"content_sha256": content_hash}
         )
 
-        with psycopg.connect(
-            self._database_url,
-            row_factory=dict_row,
-        ) as conn:
-            # Serialize registrations within this collection.
-            # hashtextextended returns a PostgreSQL bigint lock key.
-            conn.execute(
-                """
-                SELECT pg_advisory_xact_lock(
-                    hashtextextended(%s, 0)
-                )
-                """,
-                (collection_id,),
-            )
+        logger.debug(
+            "Registering document %s in collection %s",
+            request.document_id,
+            collection_id,
+        )
 
-            # 1. Check the idempotency key before checking content.
-            if request_key:
-                previous = conn.execute(
+        try:
+            with self._connect() as conn:
+                logger.debug("Registration database connection opened")
+
+                # Serialize registrations within this collection.
+                logger.debug("Acquiring collection advisory lock")
+
+                conn.execute(
                     """
-                    SELECT content_sha256, canonical_document_id
-                    FROM ingestion_request_keys
-                    WHERE collection_id = %s
-                      AND idempotency_key = %s
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(%s, 0)
+                    )
                     """,
-                    (collection_id, request_key),
-                ).fetchone()
+                    (collection_id,),
+                )
 
-                if previous is not None:
-                    if previous["content_sha256"] != content_hash:
-                        raise IdempotencyKeyConflict(
-                            "The collection idempotency key was already "
-                            "used for different content."
-                        )
+                logger.debug("Collection advisory lock acquired")
 
-                    canonical = conn.execute(
+                # 1. Check the idempotency key before checking content.
+                if request_key:
+                    previous = conn.execute(
                         """
-                        SELECT status
-                        FROM ingestion_documents
-                        WHERE document_id = %s
+                        SELECT content_sha256, canonical_document_id
+                        FROM ingestion_request_keys
+                        WHERE collection_id = %s
+                          AND idempotency_key = %s
                         """,
-                        (previous["canonical_document_id"],),
+                        (collection_id, request_key),
                     ).fetchone()
 
-                    if canonical is None:
-                        raise RuntimeError(
-                            "Idempotency mapping references a missing "
-                            "canonical document."
+                    if previous is not None:
+                        if previous["content_sha256"] != content_hash:
+                            raise IdempotencyKeyConflict(
+                                "The collection idempotency key was already "
+                                "used for different content."
+                            )
+
+                        canonical = conn.execute(
+                            """
+                            SELECT status
+                            FROM ingestion_documents
+                            WHERE document_id = %s
+                            """,
+                            (previous["canonical_document_id"],),
+                        ).fetchone()
+
+                        if canonical is None:
+                            raise RuntimeError(
+                                "Idempotency mapping references a missing "
+                                "canonical document."
+                            )
+
+                        return DocumentIngestionResult(
+                            document_id=previous["canonical_document_id"],
+                            collection_id=collection_id,
+                            status=IngestionStatus(canonical["status"]),
+                            content_sha256=content_hash,
+                        )
+
+                # 2. Look for existing content in this collection.
+                existing = conn.execute(
+                    """
+                    SELECT document_id
+                    FROM ingestion_documents
+                    WHERE collection_id = %s
+                      AND content_sha256 = %s
+                    """,
+                    (collection_id, content_hash),
+                ).fetchone()
+
+                if existing is not None:
+                    canonical_id = existing["document_id"]
+
+                    if request_key:
+                        conn.execute(
+                            """
+                            INSERT INTO ingestion_request_keys (
+                                collection_id,
+                                idempotency_key,
+                                content_sha256,
+                                canonical_document_id
+                            )
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (
+                                collection_id,
+                                request_key,
+                                content_hash,
+                                canonical_id,
+                            ),
                         )
 
                     return DocumentIngestionResult(
-                        document_id=previous["canonical_document_id"],
+                        document_id=canonical_id,
                         collection_id=collection_id,
-                        status=IngestionStatus(canonical["status"]),
+                        status=IngestionStatus.DUPLICATE,
                         content_sha256=content_hash,
+                        duplicate_of_document_id=canonical_id,
                     )
 
-            # 2. Look for existing content in this collection.
-            existing = conn.execute(
-                """
-                SELECT document_id
-                FROM ingestion_documents
-                WHERE collection_id = %s
-                  AND content_sha256 = %s
-                """,
-                (collection_id, content_hash),
-            ).fetchone()
-
-            if existing is not None:
-                canonical_id = existing["document_id"]
+                # 3. Register new canonical content.
+                conn.execute(
+                    """
+                    INSERT INTO ingestion_documents (
+                        document_id,
+                        collection_id,
+                        content_sha256,
+                        request_data,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        normalized_request.document_id,
+                        collection_id,
+                        content_hash,
+                        Jsonb(normalized_request.model_dump(mode="json")),
+                        IngestionStatus.QUEUED.value,
+                    ),
+                )
 
                 if request_key:
                     conn.execute(
@@ -310,57 +394,22 @@ class PostgresRegistrationStore:
                             collection_id,
                             request_key,
                             content_hash,
-                            canonical_id,
+                            normalized_request.document_id,
                         ),
                     )
 
-                return DocumentIngestionResult(
-                    document_id=canonical_id,
-                    collection_id=collection_id,
-                    status=IngestionStatus.DUPLICATE,
-                    content_sha256=content_hash,
-                    duplicate_of_document_id=canonical_id,
-                )
-
-            # 3. Register new canonical content.
-            conn.execute(
-                """
-                INSERT INTO ingestion_documents (
-                    document_id,
-                    collection_id,
-                    content_sha256,
-                    request_data,
-                    status
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    normalized_request.document_id,
-                    collection_id,
-                    content_hash,
-                    Jsonb(normalized_request.model_dump(mode="json")),
-                    IngestionStatus.QUEUED.value,
-                ),
+            # The transaction has committed successfully.
+            logger.debug(
+                "Registered document %s successfully",
+                normalized_request.document_id,
             )
 
-            if request_key:
-                conn.execute(
-                    """
-                    INSERT INTO ingestion_request_keys (
-                        collection_id,
-                        idempotency_key,
-                        content_sha256,
-                        canonical_document_id
-                    )
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (
-                        collection_id,
-                        request_key,
-                        content_hash,
-                        normalized_request.document_id,
-                    ),
-                )
+        except Exception:
+            logger.exception(
+                "Registration failed for document %s",
+                request.document_id,
+            )
+            raise
 
         return DocumentIngestionResult(
             document_id=normalized_request.document_id,
