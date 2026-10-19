@@ -107,3 +107,12 @@ Measure text-PDF ingestion time under documented conditions. Evaluate OCR extrac
 Reconsider the pipeline if measured throughput, extraction quality, operational complexity, or resource use fails the documented requirements.
 
 Update the ADR when experiments support a materially different processing strategy.
+
+
+## 9. MVP limitation: Chunk identity
+
+Chunk IDs are generated using random UUIDs for the MVP. Reprocessing the same document can therefore generate different chunk IDs even when the extracted text and chunk boundaries are unchanged.
+
+Document-level deduplication does not guarantee chunk-level deduplication. Before persistent chunk storage and reprocessing are introduced, the persistence strategy must define how existing chunks are replaced, reconciled, or deduplicated.
+
+Deterministic chunk IDs are deferred until that persistence contract is designed. Page numbers and text offsets provide provenance, but are not treated as guarantees of stable chunk identity.
