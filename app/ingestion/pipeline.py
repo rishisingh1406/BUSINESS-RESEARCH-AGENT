@@ -2,6 +2,7 @@ from pathlib import Path
 import shutil
 
 from app.ingestion.chunker import chunk_document
+from app.ingestion.chunk_store import PostgresChunkStore
 from app.ingestion.parsers import PdfParseError, parse_document
 from app.ingestion.registration import RegistrationStore
 from app.ingestion.storage import resolve_storage_uri
@@ -18,9 +19,11 @@ class IngestionPipeline:
     def __init__(
         self,
         registration_store: RegistrationStore,
+        chunk_store: PostgresChunkStore,
         quarantine_dir: str | Path = "data/quarantine",
     ) -> None:
         self._registration_store = registration_store
+        self._chunk_store = chunk_store
         self._quarantine_dir = Path(quarantine_dir)
 
     def register(
@@ -153,6 +156,12 @@ class IngestionPipeline:
             parsed_document,
             document_id=request.document_id,
             collection_id=request.collection_id,
+        )
+
+        self._chunk_store.replace_document_chunks(
+            request.document_id,
+            request.collection_id,
+            chunks,
         )
 
         self._registration_store.set_status(

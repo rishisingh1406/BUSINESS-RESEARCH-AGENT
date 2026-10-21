@@ -1,4 +1,3 @@
-
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,11 +9,30 @@ from app.ingestion.storage import StorageResolutionError
 from app.schema import DocumentIngestionRequest, IngestionStatus
 
 
+class FakeChunkStore:
+    """In-memory chunk store that records what the pipeline persists."""
+
+    def __init__(self) -> None:
+        self.replaced_chunks = []
+
+    def replace_document_chunks(
+        self,
+        document_id: str,
+        collection_id: str,
+        chunks,
+    ) -> int:
+        self.replaced_chunks = list(chunks)
+        return len(chunks)
+
+
 def test_pipeline_delegates_registration_to_injected_store(
     tmp_path: Path,
 ):
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FakeChunkStore(),
+    )
 
     document = tmp_path / "annual-report.pdf"
     document.write_bytes(b"%PDF-test")
@@ -39,7 +57,10 @@ def test_pipeline_delegates_registration_to_injected_store(
 
 def test_pipeline_rejects_invalid_storage_uri_before_processing():
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FakeChunkStore(),
+    )
 
     request = DocumentIngestionRequest(
         document_id="pipeline-doc-invalid",
@@ -60,7 +81,11 @@ def test_pipeline_processes_markdown_and_returns_chunk_metadata(
     tmp_path: Path,
 ):
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    chunk_store = FakeChunkStore()
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=chunk_store,
+    )
 
     document = tmp_path / "annual-report.md"
     document.write_text(
@@ -90,6 +115,10 @@ def test_pipeline_processes_markdown_and_returns_chunk_metadata(
     assert len(result.chunk_ids) >= 1
     assert result.status == IngestionStatus.COMPLETED
 
+    # Verify that chunks were actually persisted before status flipped.
+    assert len(chunk_store.replaced_chunks) == len(result.chunk_ids)
+    assert [c.chunk_id for c in chunk_store.replaced_chunks] == result.chunk_ids
+
     # Verify that processing updated the canonical stored status.
     assert (
         store._statuses["pipeline-doc-process-1"]
@@ -101,7 +130,10 @@ def test_pipeline_quarantines_malformed_pdf(
     tmp_path: Path,
 ):
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FakeChunkStore(),
+    )
 
     document = tmp_path / "malformed-report.pdf"
     document.write_bytes(b"This is not a valid PDF file.")
@@ -138,6 +170,7 @@ def test_pipeline_moves_malformed_pdf_to_quarantine_and_records_location(
 
     pipeline = IngestionPipeline(
         registration_store=store,
+        chunk_store=FakeChunkStore(),
         quarantine_dir=quarantine_dir,
     )
 
@@ -174,7 +207,10 @@ def test_duplicate_registration_does_not_process_duplicate_file(
     tmp_path: Path,
 ):
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FakeChunkStore(),
+    )
 
     original_file = tmp_path / "original.md"
     original_file.write_text(
@@ -235,12 +271,14 @@ def test_duplicate_registration_does_not_process_duplicate_file(
     )
 
 
-
 def test_process_skips_duplicate_without_registration_argument(
     tmp_path: Path,
 ):
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FakeChunkStore(),
+    )
 
     original_file = tmp_path / "original-no-arg.md"
     original_file.write_text("# Report\n\nRevenue increased.", encoding="utf-8")
@@ -284,13 +322,15 @@ def test_process_skips_duplicate_without_registration_argument(
     assert store._statuses["no-arg-original"] == IngestionStatus.QUEUED
 
 
-
 def test_process_does_not_reprocess_completed_document(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     store = InMemoryRegistrationStore()
-    pipeline = IngestionPipeline(registration_store=store)
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FakeChunkStore(),
+    )
 
     document = tmp_path / "completed-report.md"
     document.write_text("# Report\n\nRevenue increased.", encoding="utf-8")
@@ -322,3 +362,50 @@ def test_process_does_not_reprocess_completed_document(
 
     assert second_result.status == IngestionStatus.COMPLETED
     assert second_result.document_id == first_result.document_id
+
+
+def test_pipeline_does_not_mark_completed_when_chunk_store_fails(
+    tmp_path: Path,
+):
+    """The invariant: no COMPLETED unless chunks are persisted."""
+
+    store = InMemoryRegistrationStore()
+
+    class FailingChunkStore:
+        def replace_document_chunks(
+            self,
+            document_id: str,
+            collection_id: str,
+            chunks,
+        ) -> int:
+            raise RuntimeError("chunk store unavailable")
+
+    pipeline = IngestionPipeline(
+        registration_store=store,
+        chunk_store=FailingChunkStore(),
+    )
+
+    document = tmp_path / "annual-report.md"
+    document.write_text("# Report\n\nRevenue increased.", encoding="utf-8")
+
+    request = DocumentIngestionRequest(
+        document_id="failed-chunk-store-doc",
+        collection_id="failed-chunk-store-collection",
+        original_filename=document.name,
+        content_sha256="9" * 64,
+        content_type="text/markdown",
+        file_size_bytes=document.stat().st_size,
+        upload_timestamp=datetime(2026, 10, 13, tzinfo=timezone.utc),
+        storage_uri=document.as_uri(),
+    )
+
+    pipeline.register(request)
+
+    with pytest.raises(RuntimeError, match="chunk store unavailable"):
+        pipeline.process(request)
+
+    # Document must stay QUEUED so a retry can pick it up.
+    assert (
+        store._statuses["failed-chunk-store-doc"]
+        == IngestionStatus.QUEUED
+    )
