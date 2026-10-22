@@ -148,3 +148,24 @@ class PostgresChunkStore:
                     )
 
         return len(rows)
+
+    def load_collection_chunks(
+        self,
+        collection_id: str,
+    ) -> list[tuple[str, str]]:
+        """Return (chunk_id, chunk_text) pairs for a collection.
+
+        Ordered by chunk_id for stable, reproducible BM25 scores.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_id, chunk_text
+                FROM document_chunks
+                WHERE collection_id = %s
+                ORDER BY chunk_id
+                """,
+                (collection_id,),
+            ).fetchall()
+
+        return [(row[0], row[1]) for row in rows]
