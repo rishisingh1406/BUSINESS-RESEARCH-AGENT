@@ -1,0 +1,201 @@
+DAY 16 — INDEXING LAYER STATUS
+==============================
+Last updated: 2026-10-23
+Repo: https://github.com/rishisingh1406/BUSINESS-RESEARCH-AGENT
+
+
+OBJECTIVE (from Day 16 plan)
+----------------------------
+Embeddings + pgvector done properly.
+
+Task items:
+  - sentence-transformers service (batch, concurrency-limited)
+  - pgvector table + HNSW
+  - BM25 index (rank-bm25)
+  - metadata schema (source, date, doc_id)
+  - observability: cost/doc, stage timing
+
+Output criterion:
+  - 300-page filing indexed in under 5 minutes
+  - timing report produced
+
+
+DONE (code + tests passing)
+---------------------------
+
+1. Chunk persistence (closes the Day 15 gap)
+   - PostgresChunkStore:
+       insert_chunks           append-only, rejects duplicate chunk_id
+       replace_document_chunks delete-then-insert, idempotent under
+                               at-least-once retry (closes the crash
+                               window between chunk insert and status
+                               update)
+       load_collection_chunks  (chunk_id, chunk_text) loader for BM25
+   - IngestionPipeline.process() persists chunks before flipping the
+     document to COMPLETED. A chunk-store failure leaves the document
+     QUEUED, so retry is safe.
+   - Tests: 7 in tests/test_postgres_chunk_store.py
+       atomic insert, duplicate rollback, FK rollback, empty-batch
+       short-circuit, replace idempotency, loader shape, loader empty
+
+2. Embeddings
+   - LocalEmbeddingService:
+       model           sentence-transformers/all-MiniLM-L6-v2
+       device          cpu (torch 2.10.0+cpu, no CUDA on this machine)
+       batch size      32
+       max_seq_length  512
+       normalisation   L2 (so cosine == dot, HNSW cosine ordering valid)
+       loading         lazy, single instance per process, thread lock
+   - PostgresEmbeddingStore.insert_embeddings:
+       batched, single transaction, embedding_model recorded per row
+   - Migration 003_chunk_embeddings.sql:
+       CREATE EXTENSION IF NOT EXISTS vector
+       chunk_embeddings table
+         chunk_id        PK, FK -> document_chunks ON DELETE CASCADE
+         embedding_model text NOT NULL, non-blank check
+         embedding       vector(384) NOT NULL
+         created_at      timestamptz
+       Applied to business_research and business_research_test.
+   - Tests: 5 in tests/test_embedding_service.py
+            5 in tests/test_postgres_embedding_store.py
+            (including cascade verification: delete chunk -> embedding
+             row disappears)
+
+3. BM25
+   - app/ingestion/bm25_index.py:
+       tokenize()          lowercase, extract [a-z0-9]+ runs
+       Bm25Index.search()  collection-scoped, injected loader, top_k
+   - Candidate definition: chunk contains >= 1 query token.
+     NOT score > 0. rank_bm25's BM25Okapi returns zero or negative
+     IDF for query terms that appear in half or more of the corpus,
+     so score-filtering silently drops genuine matches. This was a
+     real bug caught by the tests; do not reintroduce it.
+   - Tests: 10 in tests/test_bm25_index.py
+
+
+WRITTEN BUT DELIBERATELY NOT APPLIED
+------------------------------------
+
+  Migration 004_chunk_embeddings_hnsw.sql
+    Creates HNSW index on chunk_embeddings.embedding using
+    vector_cosine_ops with m=16, ef_construction=128.
+
+    DO NOT APPLY UNTIL AFTER THE FIRST REAL BATCH OF EMBEDDINGS.
+    Reasons:
+      - Building an index on an empty table wastes work; the planner
+        won't use it meaningfully at very small row counts anyway.
+      - maintenance_work_mem should be raised (e.g. 512MB) in the same
+        session as the CREATE INDEX for faster construction.
+
+    Apply after the 300-page run, not before.
+
+
+NOT STARTED (blocks the output criterion)
+-----------------------------------------
+
+1. Worker integration
+   - IngestionWorker.process_one currently calls pipeline.process(),
+     which persists chunks but never calls LocalEmbeddingService or
+     PostgresEmbeddingStore.
+   - Production chunks are therefore stored but NOT embedded.
+   - This is the single biggest gap. Until this is wired, "indexed"
+     is not true in the production path.
+   - Needs: scripts/run_worker.py (new file). No existing worker
+     bootstrap outside tests. The only CLI entry point currently in
+     the repo is scripts/ingestion_status.py.
+
+2. Metadata convention (source, date, doc_id)
+   - Decision made: use document_chunks.metadata JSONB rather than a
+     new migration. Every chunk carries:
+         {"source": <original_filename>, "filing_date": <ISO date|null>}
+     alongside whatever the parser put in.
+   - NOT IMPLEMENTED. Chunker does not yet inject these keys.
+   - Rationale: metadata JSONB is already queryable via ->>, and a
+     new migration before real filings are seen would likely need
+     revision. Promote to real columns once the source set stabilises.
+
+3. Observability (stage timing, cost per document)
+   - Nothing implemented.
+   - Plan:
+       context manager emitting structured log fields per stage:
+         document_id, stage, duration_ms, chunk_count, token_count,
+         model_name
+       stages: parse, chunk, embed, insert_chunks, insert_embeddings,
+               mark_completed
+   - Cost per document = 0 in API terms (local model), but record
+     CPU-seconds per document for future comparison.
+
+4. 300-page filing end-to-end timing run
+   - Not started. Depends on worker integration + observability.
+   - Need: (a) a 300-page test document, or (b) a synthetic generator
+     producing a realistic multi-section "filing".
+
+
+TEST STATE AT LAST VERIFIED RUN
+-------------------------------
+
+  Full suite without TEST_DATABASE_URL:  124 passed, 20 skipped
+    - Skips are all PostgreSQL integration tests (no TEST_DATABASE_URL
+      in that session) and Redis integration tests (Redis not running).
+  Full suite with both up (expected):    ~144 passed
+  Runtime: 20-25s if sentence_transformers import stays top-level;
+           5s if the import is moved into _get_model().
+
+
+KNOWN FRAGILITIES
+-----------------
+
+1. TEST_DATABASE_URL and Redis are session-scoped. Every new PowerShell
+   window starts blank. Suggest a setup-env.ps1 script, dot-sourced per
+   session:
+       $line = Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1
+       $dbUrl = ($line -replace '^DATABASE_URL=', '').Trim('"').Trim("'")
+       $env:TEST_DATABASE_URL = $dbUrl -replace '/business_research$', '/business_research_test'
+       docker start business-research-redis | Out-Null
+
+2. sentence_transformers is imported at module scope in
+   embedding_service.py. This costs 20-25s per pytest session even for
+   tests that never touch the model. Moving the import into
+   _get_model() with a TYPE_CHECKING guard fixes it (~5 lines).
+
+3. Chunk IDs are UUID4 (per ADR-002). Deterministic IDs remain
+   deferred. replace_document_chunks makes retries safe despite this,
+   because it deletes then reinserts in one transaction.
+
+4. Registration -> Redis enqueue is still not atomic (Day 15 handoff,
+   section 3). A document can be registered in Postgres with no
+   corresponding Redis job if enqueueing fails. Not addressed in Day 16.
+   Options on the table: defer / reconciliation sweeper / transactional
+   outbox. No decision made.
+
+
+NEXT STEPS (in order)
+---------------------
+
+  1. Write scripts/run_worker.py.
+     Wires: RedisIngestionQueue, PostgresRegistrationStore,
+            PostgresChunkStore, LocalEmbeddingService,
+            PostgresEmbeddingStore, IngestionWorker.
+     After pipeline.process returns COMPLETED:
+         chunks = chunk_store.load_collection_chunks(collection_id)
+         vectors = embedding_service.embed_texts([t for _, t in chunks])
+         embedding_store.insert_embeddings(
+             model_name,
+             [ChunkEmbedding(chunk_id, vector) for ...]
+         )
+     This is where the cascade invariant matters: replace_document_chunks
+     deletes old chunks (which cascades away old embeddings), so
+     inserting embeddings after processing never sees stale rows.
+
+  2. Inject metadata (source, filing_date) into chunker output.
+
+  3. Add timing instrumentation to pipeline.process() and the worker's
+     embed step.
+
+  4. Create or obtain a 300-page filing. Run end-to-end. Measure.
+
+  5. Apply migration 004 (HNSW) after embeddings exist.
+
+  6. Produce timing report from structured logs.
+
+  7. Commit with a real message (not "project update").
